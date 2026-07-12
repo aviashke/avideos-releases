@@ -59,6 +59,10 @@ struct PlayerDetailContent: View {
     /// of sliding away under the menu). Auto-resumes shortly after.
     @State private var holdAutoScroll = false
     @State private var holdScrollTask: Task<Void, Never>?
+    /// The sentence whose skip menu is being presented. Keeping the source row
+    /// visibly selected makes it unambiguous which recurring line the rule will
+    /// mute, even while the rest of the transcript is dimmed by the system menu.
+    @State private var pendingSkipBlockIndex: Int?
 
     /// Live carousel drag: the transcript pane's current horizontal offset. Driven
     /// 1:1 by the finger while dragging, then eased to 0/±paneWidth to complete or
@@ -514,19 +518,22 @@ struct PlayerDetailContent: View {
 
     /// Freeze the follow-along scroll while the listener decides on a line, with a
     /// safety timeout so it always resumes even if the menu is dismissed silently.
-    private func beginScrollHold() {
+    private func beginScrollHold(blockIndex: Int) {
         holdAutoScroll = true
+        pendingSkipBlockIndex = blockIndex
         holdScrollTask?.cancel()
-        holdScrollTask = Task {
+        holdScrollTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 12_000_000_000)
             guard !Task.isCancelled else { return }
             holdAutoScroll = false
+            pendingSkipBlockIndex = nil
         }
     }
 
     private func endScrollHold() {
         holdScrollTask?.cancel()
         holdAutoScroll = false
+        pendingSkipBlockIndex = nil
     }
 
     private var activeMode: some View {
@@ -649,10 +656,10 @@ struct PlayerDetailContent: View {
                 .transition(.opacity)
             }
         }
-        .padding(.horizontal)
-        .padding(.vertical, 12)
+        .padding(.horizontal, controlsCollapsed ? 10 : 12)
+        .padding(.vertical, controlsCollapsed ? 8 : 12)
         .floatingGlass()
-        .padding(.horizontal, controlsCollapsed ? 90 : 10)
+        .padding(.horizontal, controlsCollapsed ? 0 : 10)
         .padding(.bottom, 8)
         .background(GeometryReader { geo in
             Color.clear.preference(key: ControlsHeightKey.self, value: geo.size.height)
@@ -663,7 +670,7 @@ struct PlayerDetailContent: View {
     /// progress stroke showing how far to the end). Tapping the pill itself brings
     /// the full controls back.
     private var collapsedControls: some View {
-        HStack(spacing: 24) {
+        HStack(spacing: 18) {
             Button {
                 _ = player.captureHighlight()
                 scheduleCollapse()
@@ -689,7 +696,6 @@ struct PlayerDetailContent: View {
             .frame(width: 38, height: 38)
         }
         // Tap anywhere on the pill (outside the two buttons) to expand.
-        .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
         .onTapGesture { expandControls() }
     }
@@ -906,7 +912,8 @@ struct PlayerDetailContent: View {
                          fontSize: bodyFontSize,
                          listDepth: sentence.listDepth,
                          bulletMarker: sentence.bulletMarker,
-                         isSkipped: skipped)
+                         isSkipped: skipped,
+                         isPendingSkip: pendingSkipBlockIndex == index)
                 .contentShape(Rectangle())
                 .onTapGesture {
                     // A struck-through line: tap to offer reading it again.
@@ -930,7 +937,9 @@ struct PlayerDetailContent: View {
                 // comfortably past a quick tap (which releases well under that)
                 // but well ahead of the menu.
                 .simultaneousGesture(
-                    LongPressGesture(minimumDuration: 0.15).onEnded { _ in beginScrollHold() }
+                    LongPressGesture(minimumDuration: 0.15).onEnded { _ in
+                        beginScrollHold(blockIndex: index)
+                    }
                 )
         case .image(let image):
             ImageBlockView(image: image, isCurrent: isCurrent) {
@@ -1120,6 +1129,8 @@ private struct SentenceText: View {
     /// A line the listener muted with a skip rule: shown struck-through and dimmed
     /// so it's clearly not read, but still visible and tappable to un-skip.
     var isSkipped: Bool = false
+    /// True while this line's skip-rule menu is open/about to open.
+    var isPendingSkip: Bool = false
 
     /// Must match the transcript's `VStack` spacing so a run's fill bridges the
     /// gap to the next sentence exactly, with no seam and no overlap.
@@ -1147,7 +1158,10 @@ private struct SentenceText: View {
             // A lone noted sentence that's being read gets the "now reading" accent
             // as a ring; within a multi-sentence run the highlighted word suffices.
             .overlay {
-                if isCurrent && notedPosition == .single {
+                if isPendingSkip {
+                    RoundedRectangle(cornerRadius: Self.cornerRadius)
+                        .strokeBorder(Color.orange, lineWidth: 2)
+                } else if isCurrent && notedPosition == .single {
                     RoundedRectangle(cornerRadius: Self.cornerRadius)
                         .strokeBorder(Color.accentColor, lineWidth: 2)
                 }
@@ -1155,7 +1169,12 @@ private struct SentenceText: View {
             // One marker for the whole highlight (on its first sentence), so a
             // passage spanning several sentences doesn't look like several notes.
             .overlay(alignment: isRTL ? .topLeading : .topTrailing) {
-                if showMarker {
+                if isPendingSkip {
+                    Image(systemName: "speaker.slash.fill")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.orange)
+                        .padding(5)
+                } else if showMarker {
                     Image(systemName: markerIsNote ? "note.text" : "highlighter")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.orange)
@@ -1196,7 +1215,10 @@ private struct SentenceText: View {
     /// the recolored spoken word marks the reading position instead.
     @ViewBuilder
     private var highlightBackground: some View {
-        if isNoted {
+        if isPendingSkip {
+            RoundedRectangle(cornerRadius: Self.cornerRadius)
+                .fill(Color.orange.opacity(0.18))
+        } else if isNoted {
             UnevenRoundedRectangle(
                 topLeadingRadius: roundsTop ? Self.cornerRadius : 0,
                 bottomLeadingRadius: roundsBottom ? Self.cornerRadius : 0,

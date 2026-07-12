@@ -536,7 +536,29 @@ final class EmailPlayerViewModel: ObservableObject {
         isComplete = false
         cancelPendingSkip()
         resetLookback()
+        // AVSpeechSynthesizer can permanently wedge if an active utterance is
+        // stopped and a replacement is submitted immediately. A paragraph tap is
+        // an explicit discontinuous jump, so give it a fresh engine instead of
+        // racing stop/speak on the existing synthesizer. Natural progression keeps
+        // using the same engine and remains gap-free.
+        replaceEngineForManualJump()
         speakBlock(at: index)
+    }
+
+    private func replaceEngineForManualJump() {
+        let oldEngine = engine
+        oldEngine.onFinish = nil
+        oldEngine.onWordRange = nil
+        oldEngine.onError = nil
+        if let eleven = oldEngine as? ElevenLabsSpeechEngine {
+            eleven.onSynthesized = nil
+        }
+        oldEngine.stop()
+
+        engine = Self.makeEngine(settings: settings)
+        engine.preferredLanguage = dominantLanguageCode
+        wire(engine)
+        engineSignature = currentEngineSignature()
     }
 
     /// Forget the spoken-block history that feeds the highlight lookback window.
