@@ -59,11 +59,6 @@ struct PlayerDetailContent: View {
     /// of sliding away under the menu). Auto-resumes shortly after.
     @State private var holdAutoScroll = false
     @State private var holdScrollTask: Task<Void, Never>?
-    /// The sentence whose skip menu is being presented. Keeping the source row
-    /// visibly selected makes it unambiguous which recurring line the rule will
-    /// mute, even while the rest of the transcript is dimmed by the system menu.
-    @State private var pendingSkipBlockIndex: Int?
-
     /// Live carousel drag: the transcript pane's current horizontal offset. Driven
     /// 1:1 by the finger while dragging, then eased to 0/±paneWidth to complete or
     /// cancel a swipe, and to 0 whenever a new item lands (see the item-change
@@ -518,22 +513,19 @@ struct PlayerDetailContent: View {
 
     /// Freeze the follow-along scroll while the listener decides on a line, with a
     /// safety timeout so it always resumes even if the menu is dismissed silently.
-    private func beginScrollHold(blockIndex: Int) {
+    private func beginScrollHold() {
         holdAutoScroll = true
-        pendingSkipBlockIndex = blockIndex
         holdScrollTask?.cancel()
         holdScrollTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 12_000_000_000)
             guard !Task.isCancelled else { return }
             holdAutoScroll = false
-            pendingSkipBlockIndex = nil
         }
     }
 
     private func endScrollHold() {
         holdScrollTask?.cancel()
         holdAutoScroll = false
-        pendingSkipBlockIndex = nil
     }
 
     private var activeMode: some View {
@@ -912,8 +904,7 @@ struct PlayerDetailContent: View {
                          fontSize: bodyFontSize,
                          listDepth: sentence.listDepth,
                          bulletMarker: sentence.bulletMarker,
-                         isSkipped: skipped,
-                         isPendingSkip: pendingSkipBlockIndex == index)
+                         isSkipped: skipped)
                 .contentShape(Rectangle())
                 .onTapGesture {
                     // A struck-through line: tap to offer reading it again.
@@ -922,25 +913,16 @@ struct PlayerDetailContent: View {
                     if skipped { unskipText = sentence.text }
                     else if isActive { player.jump(toBlock: index) }
                 }
-                .contextMenu { skipMenu(for: sentence, isSkipped: skipped) }
-                // A long-press on THIS sentence means its mute menu is about to
-                // appear — freeze auto-scroll until the decision is made (or a
-                // timeout). Scoped to just this row (not the whole transcript)
-                // so every other paragraph's plain tap has nothing extra to
-                // arbitrate against. Must win the race against the system's own
-                // long-press-to-menu recognition (which takes ~0.4-0.5s) with
-                // real margin — landing at the same time (as a prior version of
-                // this did, at 0.5s) was still too late: one more auto-scroll
-                // could land in that gap, animating the transcript to a new
-                // position while the menu's frozen preview still showed the old
-                // one — exactly the double-exposed text this fixes. 0.15s is
-                // comfortably past a quick tap (which releases well under that)
-                // but well ahead of the menu.
-                .simultaneousGesture(
-                    LongPressGesture(minimumDuration: 0.15).onEnded { _ in
-                        beginScrollHold(blockIndex: index)
-                    }
-                )
+                // Keep one recognizer in charge of the long press. A separate
+                // LongPressGesture used to update the row before iOS finished
+                // presenting this menu, which could invalidate the source view
+                // and cancel the menu entirely. The preview supplies the visual
+                // confirmation without mutating the transcript mid-gesture.
+                .contextMenu {
+                    skipMenu(for: sentence, isSkipped: skipped)
+                } preview: {
+                    skipPreview(for: sentence, isSkipped: skipped)
+                }
         case .image(let image):
             ImageBlockView(image: image, isCurrent: isCurrent) {
                 player.skipImage()
@@ -980,6 +962,25 @@ struct PlayerDetailContent: View {
                 }
             }
         }
+    }
+
+    /// The lifted context-menu preview makes the exact sentence being muted
+    /// unmistakable, without changing the source row while the long press is
+    /// still being recognized.
+    private func skipPreview(for sentence: Sentence, isSkipped: Bool) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: isSkipped ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                .foregroundStyle(isSkipped ? Color.accentColor : .orange)
+            Text(sentence.text)
+                .font(.body)
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.leading)
+        }
+        .padding(16)
+        .frame(maxWidth: 340, alignment: .leading)
+        .background(Color(.secondarySystemBackground))
+        .onAppear { beginScrollHold() }
+        .onDisappear { endScrollHold() }
     }
 
     /// The sender address of what's on screen, for matching skip rules.
@@ -1129,9 +1130,6 @@ private struct SentenceText: View {
     /// A line the listener muted with a skip rule: shown struck-through and dimmed
     /// so it's clearly not read, but still visible and tappable to un-skip.
     var isSkipped: Bool = false
-    /// True while this line's skip-rule menu is open/about to open.
-    var isPendingSkip: Bool = false
-
     /// Must match the transcript's `VStack` spacing so a run's fill bridges the
     /// gap to the next sentence exactly, with no seam and no overlap.
     private static let blockSpacing: CGFloat = 16
@@ -1158,10 +1156,7 @@ private struct SentenceText: View {
             // A lone noted sentence that's being read gets the "now reading" accent
             // as a ring; within a multi-sentence run the highlighted word suffices.
             .overlay {
-                if isPendingSkip {
-                    RoundedRectangle(cornerRadius: Self.cornerRadius)
-                        .strokeBorder(Color.orange, lineWidth: 2)
-                } else if isCurrent && notedPosition == .single {
+                if isCurrent && notedPosition == .single {
                     RoundedRectangle(cornerRadius: Self.cornerRadius)
                         .strokeBorder(Color.accentColor, lineWidth: 2)
                 }
@@ -1169,12 +1164,7 @@ private struct SentenceText: View {
             // One marker for the whole highlight (on its first sentence), so a
             // passage spanning several sentences doesn't look like several notes.
             .overlay(alignment: isRTL ? .topLeading : .topTrailing) {
-                if isPendingSkip {
-                    Image(systemName: "speaker.slash.fill")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.orange)
-                        .padding(5)
-                } else if showMarker {
+                if showMarker {
                     Image(systemName: markerIsNote ? "note.text" : "highlighter")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.orange)
@@ -1215,10 +1205,7 @@ private struct SentenceText: View {
     /// the recolored spoken word marks the reading position instead.
     @ViewBuilder
     private var highlightBackground: some View {
-        if isPendingSkip {
-            RoundedRectangle(cornerRadius: Self.cornerRadius)
-                .fill(Color.orange.opacity(0.18))
-        } else if isNoted {
+        if isNoted {
             UnevenRoundedRectangle(
                 topLeadingRadius: roundsTop ? Self.cornerRadius : 0,
                 bottomLeadingRadius: roundsBottom ? Self.cornerRadius : 0,
