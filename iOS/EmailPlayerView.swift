@@ -59,6 +59,19 @@ struct PlayerDetailContent: View {
     /// of sliding away under the menu). Auto-resumes shortly after.
     @State private var holdAutoScroll = false
     @State private var holdScrollTask: Task<Void, Never>?
+    /// The sentence selected by the dedicated reader-mode hold gesture. We use
+    /// our own confirmation dialog instead of UIContextMenuInteraction because
+    /// the surrounding ScrollView and horizontal carousel can make the system
+    /// context-menu recognizer lose the same touch intermittently.
+    @State private var pendingSkip: PendingSkip?
+
+    private struct PendingSkip {
+        let blockIndex: Int
+        let text: String
+        let senderAddress: String
+        let senderLabel: String
+        let isSkipped: Bool
+    }
     /// Live carousel drag: the transcript pane's current horizontal offset. Driven
     /// 1:1 by the finger while dragging, then eased to 0/±paneWidth to complete or
     /// cancel a swipe, and to 0 whenever a new item lands (see the item-change
@@ -308,6 +321,40 @@ struct PlayerDetailContent: View {
             } message: { _ in
                 Text("Un-mutes it everywhere it was muted.")
             }
+            .confirmationDialog(
+                pendingSkip?.isSkipped == true
+                    ? "Read this sentence again?"
+                    : "Never read this sentence again?",
+                isPresented: Binding(
+                    get: { pendingSkip != nil },
+                    set: { if !$0 { endScrollHold() } }
+                ),
+                titleVisibility: .visible,
+                presenting: pendingSkip
+            ) { selection in
+                if selection.isSkipped {
+                    Button("Read it again") {
+                        unskipMatching(selection.text)
+                        endScrollHold()
+                    }
+                } else {
+                    Button("Skip from this sender") {
+                        skipRules.add(phrase: selection.text,
+                                      sender: selection.senderAddress,
+                                      label: selection.senderLabel)
+                        endScrollHold()
+                    }
+                    Button("Skip from everyone") {
+                        skipRules.add(phrase: selection.text,
+                                      sender: "",
+                                      label: selection.senderLabel)
+                        endScrollHold()
+                    }
+                }
+                Button("Cancel", role: .cancel) { endScrollHold() }
+            } message: { selection in
+                Text(selection.text)
+            }
             .alert("Playback problem", isPresented: .constant(player.errorMessage != nil)) {
                 Button("OK") { player.errorMessage = nil }
             } message: {
@@ -319,6 +366,7 @@ struct PlayerDetailContent: View {
     private func withLifecycle<Content: View>(_ content: Content) -> some View {
         content
             .onChange(of: player.parsed?.email.id) { _, _ in
+                endScrollHold()
                 dismissedVoiceWarning = false
                 renderPiP()
                 // A new item: open the full controls, then let them settle back down.
@@ -526,6 +574,7 @@ struct PlayerDetailContent: View {
     private func endScrollHold() {
         holdScrollTask?.cancel()
         holdAutoScroll = false
+        pendingSkip = nil
     }
 
     private var activeMode: some View {
@@ -904,7 +953,8 @@ struct PlayerDetailContent: View {
                          fontSize: bodyFontSize,
                          listDepth: sentence.listDepth,
                          bulletMarker: sentence.bulletMarker,
-                         isSkipped: skipped)
+                         isSkipped: skipped,
+                         isPendingSkip: pendingSkip?.blockIndex == index)
                 .contentShape(Rectangle())
                 .onTapGesture {
                     // A struck-through line: tap to offer reading it again.
@@ -913,16 +963,18 @@ struct PlayerDetailContent: View {
                     if skipped { unskipText = sentence.text }
                     else if isActive { player.jump(toBlock: index) }
                 }
-                // Keep one recognizer in charge of the long press. A separate
-                // LongPressGesture used to update the row before iOS finished
-                // presenting this menu, which could invalidate the source view
-                // and cancel the menu entirely. The preview supplies the visual
-                // confirmation without mutating the transcript mid-gesture.
-                .contextMenu {
-                    skipMenu(for: sentence, isSkipped: skipped)
-                } preview: {
-                    skipPreview(for: sentence, isSkipped: skipped)
-                }
+                // A short, high-priority hold with more movement tolerance than
+                // the system context menu. It either completes as a hold or fails
+                // quickly into normal scrolling/swiping; there is no second
+                // context-menu recognizer competing for the same touch.
+                .highPriorityGesture(
+                    LongPressGesture(minimumDuration: 0.32, maximumDistance: 24)
+                        .onEnded { _ in
+                            presentSkipChoices(for: sentence,
+                                               blockIndex: index,
+                                               isSkipped: skipped)
+                        }
+                )
         case .image(let image):
             ImageBlockView(image: image, isCurrent: isCurrent) {
                 player.skipImage()
@@ -931,56 +983,17 @@ struct PlayerDetailContent: View {
         }
     }
 
-    /// Long-press menu on a sentence: teach the app to never read this recurring
-    /// line — for this sender (e.g. Substack's "Read in app") or for everyone.
-    /// On an already-skipped line, it offers to read it again instead.
-    @ViewBuilder
-    private func skipMenu(for sentence: Sentence, isSkipped: Bool) -> some View {
-        if let from = player.parsed?.email.from ?? player.staged?.email.from {
-            if isSkipped {
-                Button {
-                    endScrollHold()
-                    unskipMatching(sentence.text)
-                } label: {
-                    Label("Read again", systemImage: "speaker.wave.2")
-                }
-            } else {
-                Button {
-                    endScrollHold()
-                    // Scope to this exact sender address, so muting "Read in app"
-                    // for one Substack author doesn't mute it for other authors
-                    // (who all share the substack.com domain).
-                    SkipRuleStore.shared.add(phrase: sentence.text, sender: from.address, label: from.displayName)
-                } label: {
-                    Label("Skip from this sender", systemImage: "speaker.slash")
-                }
-                Button {
-                    endScrollHold()
-                    SkipRuleStore.shared.add(phrase: sentence.text, sender: "", label: from.displayName)
-                } label: {
-                    Label("Skip from everyone", systemImage: "speaker.slash.fill")
-                }
-            }
-        }
-    }
-
-    /// The lifted context-menu preview makes the exact sentence being muted
-    /// unmistakable, without changing the source row while the long press is
-    /// still being recognized.
-    private func skipPreview(for sentence: Sentence, isSkipped: Bool) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: isSkipped ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                .foregroundStyle(isSkipped ? Color.accentColor : .orange)
-            Text(sentence.text)
-                .font(.body)
-                .foregroundStyle(.primary)
-                .multilineTextAlignment(.leading)
-        }
-        .padding(16)
-        .frame(maxWidth: 340, alignment: .leading)
-        .background(Color(.secondarySystemBackground))
-        .onAppear { beginScrollHold() }
-        .onDisappear { endScrollHold() }
+    private func presentSkipChoices(for sentence: Sentence,
+                                    blockIndex: Int,
+                                    isSkipped: Bool) {
+        guard let from = player.parsed?.email.from ?? player.staged?.email.from else { return }
+        beginScrollHold()
+        pendingSkip = PendingSkip(blockIndex: blockIndex,
+                                  text: sentence.text,
+                                  senderAddress: from.address,
+                                  senderLabel: from.displayName,
+                                  isSkipped: isSkipped)
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
 
     /// The sender address of what's on screen, for matching skip rules.
@@ -1130,6 +1143,8 @@ private struct SentenceText: View {
     /// A line the listener muted with a skip rule: shown struck-through and dimmed
     /// so it's clearly not read, but still visible and tappable to un-skip.
     var isSkipped: Bool = false
+    /// True while the skip choices for this exact sentence are visible.
+    var isPendingSkip: Bool = false
     /// Must match the transcript's `VStack` spacing so a run's fill bridges the
     /// gap to the next sentence exactly, with no seam and no overlap.
     private static let blockSpacing: CGFloat = 16
@@ -1156,7 +1171,10 @@ private struct SentenceText: View {
             // A lone noted sentence that's being read gets the "now reading" accent
             // as a ring; within a multi-sentence run the highlighted word suffices.
             .overlay {
-                if isCurrent && notedPosition == .single {
+                if isPendingSkip {
+                    RoundedRectangle(cornerRadius: Self.cornerRadius)
+                        .strokeBorder(Color.orange, lineWidth: 2)
+                } else if isCurrent && notedPosition == .single {
                     RoundedRectangle(cornerRadius: Self.cornerRadius)
                         .strokeBorder(Color.accentColor, lineWidth: 2)
                 }
@@ -1164,7 +1182,12 @@ private struct SentenceText: View {
             // One marker for the whole highlight (on its first sentence), so a
             // passage spanning several sentences doesn't look like several notes.
             .overlay(alignment: isRTL ? .topLeading : .topTrailing) {
-                if showMarker {
+                if isPendingSkip {
+                    Image(systemName: "speaker.slash.fill")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.orange)
+                        .padding(5)
+                } else if showMarker {
                     Image(systemName: markerIsNote ? "note.text" : "highlighter")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.orange)
@@ -1205,7 +1228,10 @@ private struct SentenceText: View {
     /// the recolored spoken word marks the reading position instead.
     @ViewBuilder
     private var highlightBackground: some View {
-        if isNoted {
+        if isPendingSkip {
+            RoundedRectangle(cornerRadius: Self.cornerRadius)
+                .fill(Color.orange.opacity(0.18))
+        } else if isNoted {
             UnevenRoundedRectangle(
                 topLeadingRadius: roundsTop ? Self.cornerRadius : 0,
                 bottomLeadingRadius: roundsBottom ? Self.cornerRadius : 0,
