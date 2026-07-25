@@ -1,11 +1,11 @@
 import SwiftUI
 import WebKit
 
-/// A custom in-app browser modelled on X/Twitter's: the web page fills the sheet
+/// A custom in-app browser modelled on X/Twitter's: the web page fills its pane
 /// and a floating rounded toolbar sits near the bottom (close, back, a centered
 /// domain pill with a share/copy/open menu, and refresh), with a slim load-
-/// progress line up top. Presented as a bottom sheet (drag down to dismiss, drag
-/// to the half-height detent to keep it around while you glance at the reader).
+/// progress line up top. Its host animates the pane's lower edge so the original
+/// reader remains visible underneath during and after the transition.
 struct InAppBrowserView: View {
     @StateObject private var model: BrowserModel
     @Environment(\.openURL) private var openURL
@@ -13,10 +13,6 @@ struct InAppBrowserView: View {
     /// Called when the close button is tapped (the host owns dismissal, since this
     /// is revealed behind the reader rather than presented as a sheet).
     var onClose: () -> Void = {}
-
-    /// True once the page has finished its first load — the host waits for this
-    /// (up to a cap) before revealing, so it never opens to a blank page.
-    var isReady: Bool { model.progress >= 1 || !model.isLoading }
 
     init(url: URL, onClose: @escaping () -> Void = {}) {
         self.startURL = url

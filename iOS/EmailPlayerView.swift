@@ -24,12 +24,11 @@ struct PlayerDetailContent: View {
     /// A struck-through line the listener tapped, offering to read it again.
     @State private var unskipText: String?
 
-    /// The article being opened in the in-app browser (nil = closed). It loads
-    /// *behind* the reader; `browserOpen` then slides the reader down to reveal it.
+    /// The article being opened in the in-app browser (nil = closed).
     @State private var browserLink: BrowserLink?
-    /// True once the browser has come forward over the reader.
+    /// True while the browser occupies the upper pane and the real reader remains
+    /// visible in the lower peek, matching X's in-app browser transition.
     @State private var browserOpen = false
-    @State private var browserCountdown: Task<Void, Never>?
     /// Whether playback was running when the browser opened, so closing it can
     /// resume — the item is held (paused) while you're reading in-app.
     @State private var wasPlayingBeforeBrowser = false
@@ -119,87 +118,73 @@ struct PlayerDetailContent: View {
     private var bodyFontSize: CGFloat { settings.readingTextSize.bodyPointSize * readingScale }
     private var titleFontSize: CGFloat { settings.readingTextSize.titlePointSize * readingScale }
 
-    /// Height of the little "peek" strip showing the article's header underneath
-    /// the browser card, like X/Twitter — tap it to come back.
-    private static let browserPeekHeight: CGFloat = 74
+    /// X leaves roughly the lower quarter of the source post visible. Clamp that
+    /// fraction so it remains useful on both compact iPhones and large iPads.
+    private func browserPeekHeight(in availableHeight: CGFloat) -> CGFloat {
+        min(max(availableHeight * 0.24, 150), 220)
+    }
 
     // Split into a base view plus two generic modifier helpers: one big modifier
     // chain overwhelmed the SwiftUI type-checker ("unable to type-check in
     // reasonable time"), so each piece is type-checked independently.
     var body: some View {
-        ZStack(alignment: .bottom) {
-            // A small peek of the article's header, revealed only in the strip the
-            // browser card leaves uncovered at the bottom. Purely a visual "you can
-            // still see what you were reading" cue; tap it to come back.
-            if browserLink != nil { peekHeaderBar }
+        GeometryReader { geometry in
+            let peekHeight = browserPeekHeight(in: geometry.size.height)
+            let browserHeight = max(0, geometry.size.height - peekHeight)
 
-            // Fully hidden (not just dimmed) while the browser is up, so there's no
-            // transparency bleed through the browser, and it can't intercept touches.
-            readerLayer
-                .opacity(browserOpen ? 0 : 1)
-                .allowsHitTesting(!browserOpen)
+            ZStack(alignment: .top) {
+                // This is the actual reader, not a substitute header. Moving the
+                // whole surface down keeps spatial continuity with the source just
+                // like the reference: browser above, original content below.
+                readerLayer
+                    .offset(y: browserOpen ? browserHeight : 0)
+                    .allowsHitTesting(!browserOpen)
 
-            // The web page loads behind (hidden) during the count-in so it's never
-            // seen blank, then comes forward as a card leaving the peek strip
-            // showing beneath it. Kept mounted while closed (opacity 0) so
-            // reopening the same page is instant.
-            if let link = browserLink {
-                InAppBrowserView(url: link.url, onClose: closeBrowser)
-                    .id(link.id)
-                    .background(Color(.systemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: browserOpen ? 22 : 0, style: .continuous))
-                    .shadow(color: .black.opacity(browserOpen ? 0.25 : 0), radius: 16, y: -4)
-                    .padding(.bottom, browserOpen ? Self.browserPeekHeight : 0)
-                    .opacity(browserOpen ? 1 : 0)
-                    .scaleEffect(browserOpen ? 1 : 1.04, anchor: .top)
-                    .allowsHitTesting(browserOpen)
-            }
-        }
-        .animation(.spring(response: 0.5, dampingFraction: 0.86), value: browserOpen)
-    }
-
-    /// A compact card showing who it's from and the subject — the "glimpse of the
-    /// header" peeking below the browser card. Tap (or swipe up) to close the
-    /// browser and return to the full reader.
-    private var peekHeaderBar: some View {
-        Button(action: closeBrowser) {
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(player.parsed?.email.from.displayName ?? "")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    Text(player.parsed?.email.subjectOrFallback ?? "")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
+                if let link = browserLink {
+                    InAppBrowserView(url: link.url, onClose: closeBrowser)
+                        .id(link.id)
+                        .background(Color(.systemBackground))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: browserOpen ? browserHeight : 0, alignment: .top)
+                        .clipped()
+                        .clipShape(
+                            UnevenRoundedRectangle(
+                                bottomLeadingRadius: browserOpen ? 22 : 0,
+                                bottomTrailingRadius: browserOpen ? 22 : 0,
+                                style: .continuous
+                            )
+                        )
+                        .shadow(color: .black.opacity(browserOpen ? 0.22 : 0),
+                                radius: 14, y: 5)
+                        .allowsHitTesting(browserOpen)
                 }
-                Spacer(minLength: 8)
-                Image(systemName: "chevron.up")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(.secondary)
+
+                // The exposed reader strip behaves as the return target. The
+                // browser's own X button remains available as a second route.
+                if browserOpen {
+                    Button(action: closeBrowser) {
+                        Color.clear.contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: peekHeight)
+                    .offset(y: browserHeight)
+                    .accessibilityLabel("Return to reader")
+                }
             }
-            .padding(.horizontal, 20)
-            .frame(maxWidth: .infinity)
-            .frame(height: Self.browserPeekHeight)
-            .background(Color(.secondarySystemBackground))
+            .clipped()
+            .background(Color(.systemBackground))
         }
-        .buttonStyle(.plain)
-        .opacity(browserOpen ? 1 : 0)
-        .gesture(
-            DragGesture(minimumDistance: 15).onEnded { value in
-                if value.translation.height < -20 { closeBrowser() }
-            }
-        )
+        .animation(.spring(response: 0.34, dampingFraction: 0.94), value: browserOpen)
     }
 
     private var readerLayer: some View {
         withLifecycle(withPresentations(baseContent))
     }
 
-    /// Open the article. First time for a URL: load it behind the reader, play a
-    /// two-double-tap ("boo-boom, boo-boom") haptic count-in so it's not a blank
-    /// flash, then bring it forward. Reopening the same page is instant (the loaded
-    /// web view is cached).
+    /// Open immediately, as in the reference. The page's progress line handles a
+    /// slow network response; delaying the motion behind a haptic count-in made
+    /// the tap feel disconnected from the transition.
     private func startBrowser(_ url: URL) {
         // Hold on this item while you're reading in-app — otherwise playback
         // could finish and auto-advance to another article underneath you while
@@ -212,25 +197,18 @@ struct PlayerDetailContent: View {
             browserOpen = true   // same page already loaded — just show it
             return
         }
-        browserCountdown?.cancel()
         browserOpen = false
         browserLink = BrowserLink(url: url)
-        browserCountdown = Task { @MainActor in
-            let haptic = UIImpactFeedbackGenerator(style: .medium)
-            haptic.prepare()
-            for _ in 0..<2 {                                  // two double-taps
-                haptic.impactOccurred()
-                try? await Task.sleep(nanoseconds: 80_000_000)
-                haptic.impactOccurred()
-                try? await Task.sleep(nanoseconds: 360_000_000)
-            }
-            guard !Task.isCancelled, browserLink != nil else { return }
+        // Give SwiftUI one update to mount the zero-height browser, then animate
+        // its bottom edge down while the reader moves by the exact same amount.
+        Task { @MainActor in
+            await Task.yield()
+            guard browserLink != nil else { return }
             browserOpen = true
         }
     }
 
     private func closeBrowser() {
-        browserCountdown?.cancel()
         browserOpen = false
         // Keep `browserLink` (the web view stays mounted, hidden) so reopening the
         // same article is instant. It's cleared when the reader moves to a new item.
@@ -372,7 +350,6 @@ struct PlayerDetailContent: View {
                 // A new item: open the full controls, then let them settle back down.
                 expandControls()
                 // Drop the cached browser — it belonged to the previous article.
-                browserCountdown?.cancel()
                 browserOpen = false
                 browserLink = nil
                 wasPlayingBeforeBrowser = false
