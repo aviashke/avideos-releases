@@ -7,6 +7,11 @@ struct NowPlayingState: Codable, Equatable {
     var sender: String          // show / sender name (e.g. "Sharp Tech")
     var subject: String         // episode / subject line
     var senderAddress: String   // used to load the artwork on the watch
+    /// Most recent inline image reached by playback. The watch keeps showing it
+    /// until a later image replaces it, matching the lock-screen artwork behavior.
+    var artworkURL: URL?
+    /// Current spoken sentence, shown in the watch's expanded reading surface.
+    var currentSentence: String?
     var isPlaying: Bool
     var progress: Double         // 0...1 through the email
     var secondsRemaining: Int
@@ -15,6 +20,7 @@ struct NowPlayingState: Codable, Equatable {
     /// Sentinel meaning "nothing is loaded on the phone".
     static let empty = NowPlayingState(
         sender: "", subject: "", senderAddress: "",
+        artworkURL: nil, currentSentence: nil,
         isPlaying: false, progress: 0, secondsRemaining: 0, speed: 1
     )
 

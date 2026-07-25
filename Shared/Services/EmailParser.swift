@@ -211,9 +211,11 @@ enum EmailParser {
     }
 
     private static func parseHTML(_ rawHTML: String) -> [ContentBlock] {
-        // Turn list/line structure into newline-delimited lines with bullet
-        // markers *before* tags are stripped, so lists keep their shape on screen.
-        let html = annotateLists(stripNonContent(rawHTML))
+        // Preserve the HTML's visible block boundaries *before* tags are stripped,
+        // and carry list markers through as well. Without this, adjacent paragraphs
+        // such as "...effort dial" and "Forwarded this email?" collapse into one
+        // sentence whenever the first block has no terminal punctuation.
+        let html = annotateStructure(stripNonContent(rawHTML))
         var blocks: [ContentBlock] = []
         var index = 0
         let ns = html as NSString
@@ -413,7 +415,7 @@ enum EmailParser {
     // MARK: - Lists & line structure
 
     /// Invisible delimiters that carry a list item's depth and bullet marker from
-    /// `annotateLists`, through tag-stripping, into `renderText` — without ever
+    /// `annotateStructure`, through tag-stripping, into `renderText` — without ever
     /// appearing as visible text.
     private static let listSentinel = "\u{2063}"   // invisible separator
     private static let listFieldSep = "\u{241F}"   // unit separator
@@ -423,11 +425,26 @@ enum EmailParser {
     /// fold the email's own incidental newlines into spaces while keeping ours.
     private static let lineBreak = "\u{F8FF}"
 
-    /// Rewrite list tags into newline-delimited lines: every `<li>` becomes a new
-    /// line tagged (via invisible sentinels) with its nesting depth and
-    /// bullet/number, and a closing list ends the line. `<img>` and all other tags
-    /// pass through untouched so the image scanner and tag-stripper still work.
-    private static func annotateLists(_ html: String) -> String {
+    /// HTML elements that create visible text boundaries in a rendered email.
+    /// Preserve them as reader-unit boundaries so a visually separate label never
+    /// gets joined to the preceding paragraph merely because that paragraph lacks
+    /// punctuation. Both opening and closing tags are included deliberately: email
+    /// HTML is often malformed or omits optional closing tags.
+    private static let textBoundaryTags: Set<String> = [
+        "br", "hr",
+        "p", "/p", "div", "/div", "section", "/section",
+        "article", "/article", "header", "/header", "footer", "/footer",
+        "blockquote", "/blockquote", "pre", "/pre",
+        "h1", "/h1", "h2", "/h2", "h3", "/h3",
+        "h4", "/h4", "h5", "/h5", "h6", "/h6",
+        "table", "/table", "tr", "/tr", "td", "/td", "th", "/th"
+    ]
+
+    /// Rewrite structural tags into sentinel-delimited reader lines. Every `<li>`
+    /// also carries its nesting depth and bullet/number through tag stripping.
+    /// `<img>` and inline tags pass through untouched so the image scanner and
+    /// later tag-stripper still work.
+    private static func annotateStructure(_ html: String) -> String {
         let ns = html as NSString
         let tags = tagRegex.matches(in: html, range: NSRange(location: 0, length: ns.length))
         var output = ""
@@ -458,7 +475,11 @@ enum EmailParser {
                 }
                 output += lineBreak + listSentinel + "\(depth)" + listFieldSep + marker + listSentinel
             default:
-                output += raw   // keep <img>, <a>, <br>, … for the later passes
+                if textBoundaryTags.contains(tagName(raw)) {
+                    output += lineBreak
+                } else {
+                    output += raw   // keep <img>, <a>, and other inline tags
+                }
             }
         }
         if cursor < ns.length {
@@ -487,10 +508,10 @@ enum EmailParser {
         }
     }
 
-    /// Strip tags from a chunk while keeping the newlines and list sentinels that
-    /// `annotateLists` inserted, then split into blocks: each list item stays one
-    /// line (its bullet on the first sentence), plain prose splits into sentences
-    /// as before.
+    /// Strip tags from a chunk while keeping the structural boundaries and list
+    /// sentinels that `annotateStructure` inserted, then split into blocks: each
+    /// visual HTML block becomes an independent reader unit, while prose inside
+    /// that block still splits into normal sentences.
     private static func renderText(_ htmlChunk: String, startIndex: Int) -> [ContentBlock] {
         let ns = htmlChunk as NSString
         let noTags = tagRegex.stringByReplacingMatches(

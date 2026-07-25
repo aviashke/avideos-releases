@@ -1,23 +1,18 @@
 import SwiftUI
 import UIKit
 
-/// The watch is a live remote for the phone's player. It mirrors what the phone
-/// is reading (artwork, show, subject, progress, time left) and drives transport
-/// from the wrist — play/pause, skip, highlight — over WatchConnectivity.
-///
-/// Layout, top → bottom (modeled on a podcast remote):
-///   1. progress bar + "time left"
-///   2. artwork + show / subject
-///   3. transport buttons (skip back · play/pause · skip forward)
-///   4. highlight the current sentence
+/// A full-bleed watch remote for the phone's reader. The sender artwork starts as
+/// the hero image; as playback reaches inline email images, those replace it and
+/// remain visible until the next image, mirroring the iPhone lock screen.
 struct WatchNowPlayingView: View {
     @ObservedObject private var bridge = WatchConnectivityBridge.shared
+    @Namespace private var metadataAnimation
+    @State private var metadataExpanded = false
     @State private var showHighlightConfirmation = false
 
-    /// Only treat the phone as "playing something" when it has real content.
     private var state: NowPlayingState? {
-        guard let s = bridge.nowPlaying, s.hasContent else { return nil }
-        return s
+        guard let state = bridge.nowPlaying, state.hasContent else { return nil }
+        return state
     }
 
     var body: some View {
@@ -36,99 +31,252 @@ struct WatchNowPlayingView: View {
     // MARK: - Remote
 
     private func remote(_ state: NowPlayingState) -> some View {
-        VStack(spacing: 8) {
-            // 1 — progress + time remaining
-            VStack(spacing: 3) {
-                ProgressView(value: state.progress.clampedUnit).tint(.orange)
-                Text("\(state.minutesRemaining)M LEFT")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.orange)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
+        GeometryReader { geometry in
+            ZStack {
+                WatchHeroArtwork(
+                    inlineURL: state.artworkURL,
+                    senderAddress: state.senderAddress
+                )
+                .frame(width: geometry.size.width, height: geometry.size.height)
 
-            // 2 — artwork + show / subject
-            HStack(spacing: 8) {
-                WatchArtwork(address: state.senderAddress)
-                    .frame(width: 34, height: 34)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(state.sender.uppercased())
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Text(state.subject)
-                        .font(.footnote.weight(.semibold))
-                        .lineLimit(1)
+                LinearGradient(
+                    colors: [
+                        .black.opacity(0.58),
+                        .clear,
+                        .black.opacity(0.18),
+                        .black.opacity(0.88)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .allowsHitTesting(false)
+
+                playerChrome(state)
+
+                if metadataExpanded {
+                    expandedMetadata(state)
+                        .zIndex(4)
                 }
-                Spacer(minLength: 0)
             }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .clipped()
+        }
+        .ignoresSafeArea()
+        .animation(.easeInOut(duration: 0.35), value: state.artworkURL)
+    }
 
-            // 3 — transport
-            HStack(spacing: 20) {
-                transportButton("backward.fill") { bridge.send(command: .previousSentence) }
-                transportButton(state.isPlaying ? "pause.fill" : "play.fill", large: true) {
-                    bridge.send(command: state.isPlaying ? .pause : .play)
+    private func playerChrome(_ state: NowPlayingState) -> some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .top, spacing: 5) {
+                metadataButton(state)
+                Spacer(minLength: 2)
+                topControl("forward.end.fill", label: "Next email or feed item") {
+                    bridge.send(command: .nextItem)
                 }
-                transportButton("forward.fill") { bridge.send(command: .nextSentence) }
-            }
-            .padding(.vertical, 2)
-
-            // 4 — highlight the current sentence, and jump to the next item
-            HStack(spacing: 24) {
-                transportButton("highlighter", tint: .primary, font: .title2) {
+                topControl("highlighter", label: "Highlight") {
                     bridge.send(command: .highlight)
                     flashHighlight()
                 }
-                transportButton("forward.end.fill", tint: .primary, font: .title2) {
-                    bridge.send(command: .nextItem)
+            }
+
+            Spacer(minLength: 12)
+
+            VStack(spacing: 5) {
+                HStack {
+                    Text(elapsedLabel(state))
+                    Spacer()
+                    Text("-\(remainingLabel(state))")
+                }
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundStyle(.white)
+
+                ProgressView(value: state.progress.clampedUnit)
+                    .tint(.white)
+
+                HStack(spacing: 18) {
+                    transportControl("backward.fill", label: "Previous sentence") {
+                        bridge.send(command: .previousSentence)
+                    }
+                    transportControl(
+                        state.isPlaying ? "pause.fill" : "play.fill",
+                        label: state.isPlaying ? "Pause" : "Play",
+                        prominent: true
+                    ) {
+                        bridge.send(command: state.isPlaying ? .pause : .play)
+                    }
+                    transportControl("forward.fill", label: "Next sentence") {
+                        bridge.send(command: .nextSentence)
+                    }
                 }
             }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 5)
         }
-        .padding(.horizontal, 6)
+        .padding(.horizontal, 7)
+        .padding(.top, 5)
     }
 
-    private func transportButton(_ symbol: String, large: Bool = false,
-                                 tint: Color = .primary, font: Font? = nil,
-                                 action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(font ?? (large ? .title : .title3))
-                .foregroundStyle(tint)
-                .frame(width: large ? 46 : 36, height: large ? 46 : 36)
-                .contentShape(Circle())
+    private func metadataButton(_ state: NowPlayingState) -> some View {
+        Button {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+                metadataExpanded = true
+            }
+        } label: {
+            HStack(spacing: 5) {
+                WatchSenderArtwork(address: state.senderAddress)
+                    .frame(width: 28, height: 28)
+
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(state.sender)
+                        .font(.system(size: 10, weight: .bold))
+                        .lineLimit(1)
+                    Text(state.subject)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.78))
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .foregroundStyle(.white)
+            .padding(5)
+            .background(.black.opacity(0.42), in: Capsule())
+            .matchedGeometryEffect(id: "metadata", in: metadataAnimation)
         }
         .buttonStyle(.plain)
+        .frame(maxWidth: 105)
+        .accessibilityLabel("\(state.sender), \(state.subject). Show full details")
+    }
+
+    private func expandedMetadata(_ state: NowPlayingState) -> some View {
+        Button {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+                metadataExpanded = false
+            }
+        } label: {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        WatchSenderArtwork(address: state.senderAddress)
+                            .frame(width: 38, height: 38)
+                        Text(state.sender)
+                            .font(.headline)
+                            .multilineTextAlignment(.leading)
+                    }
+
+                    Text(state.subject)
+                        .font(.title3.weight(.bold))
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if let sentence = state.currentSentence, !sentence.isEmpty {
+                        Divider().overlay(.white.opacity(0.35))
+                        Text(sentence)
+                            .font(.footnote)
+                            .foregroundStyle(.white.opacity(0.82))
+                            .multilineTextAlignment(.leading)
+                    }
+
+                    Text("Tap to return to player")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .padding(.top, 2)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+            }
+            .background(.black.opacity(0.92))
+            .matchedGeometryEffect(id: "metadata", in: metadataAnimation)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white)
+        .contentShape(Rectangle())
+        .accessibilityLabel("Full email details. Tap to return to player")
+    }
+
+    private func topControl(_ symbol: String, label: String,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 31, height: 31)
+                .background(.black.opacity(0.42), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
+    private func transportControl(_ symbol: String, label: String,
+                                  prominent: Bool = false,
+                                  action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: prominent ? 20 : 16, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: prominent ? 43 : 34, height: prominent ? 43 : 34)
+                .background(
+                    prominent ? Color.white.opacity(0.22) : Color.black.opacity(0.32),
+                    in: Circle()
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
+    private func elapsedLabel(_ state: NowPlayingState) -> String {
+        let remaining = max(state.secondsRemaining, 0)
+        let total = state.progress > 0
+            ? Int(Double(remaining) / max(1 - state.progress, 0.01))
+            : remaining
+        let elapsed = max(total - remaining, 0)
+        return durationLabel(elapsed)
+    }
+
+    private func remainingLabel(_ state: NowPlayingState) -> String {
+        durationLabel(max(state.secondsRemaining, 0))
+    }
+
+    private func durationLabel(_ seconds: Int) -> String {
+        String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 
     // MARK: - Idle
 
     private var idle: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "iphone.radiowaves.left.and.right")
-                .font(.title2)
-                .foregroundStyle(.secondary)
-            Text("Nothing playing")
-                .font(.headline)
-            Text("Start reading an email on your iPhone, then control it from here.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+        ZStack {
+            LinearGradient(
+                colors: [Color.orange.opacity(0.35), .black],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: 8) {
+                Image(systemName: "iphone.radiowaves.left.and.right")
+                    .font(.title2)
+                Text("Nothing playing")
+                    .font(.headline)
+                Text("Start an email or feed on your iPhone.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding()
         }
-        .padding()
     }
 
     private var highlightToast: some View {
-        Text("Highlighted")
+        Label("Highlighted", systemImage: "highlighter")
             .font(.caption2.weight(.semibold))
-            .padding(.horizontal, 10).padding(.vertical, 5)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
             .background(.yellow, in: Capsule())
             .foregroundStyle(.black)
             .task {
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
                 showHighlightConfirmation = false
             }
     }
-
-    // MARK: - Actions
 
     private func flashHighlight() {
         showHighlightConfirmation = true
@@ -136,15 +284,70 @@ struct WatchNowPlayingView: View {
 }
 
 private extension Double {
-    /// Clamp to 0...1 so a stale snapshot can't push the progress bar out of range.
     var clampedUnit: Double { min(max(self, 0), 1) }
 }
 
-/// Small circular artwork for the watch remote: tries the same logo/avatar
-/// sources the phone uses, falling back to an envelope glyph. No image → glyph.
-private struct WatchArtwork: View {
+/// Full-screen watch artwork. Inline images take priority once playback reaches
+/// them; before that, the sender's avatar/logo fills the background.
+private struct WatchHeroArtwork: View {
+    let inlineURL: URL?
+    let senderAddress: String
+    @StateObject private var senderLoader = WatchArtworkLoader()
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                Color.gray.opacity(0.22)
+
+                if let inlineURL {
+                    AsyncImage(url: inlineURL) { phase in
+                        if case .success(let image) = phase {
+                            image
+                                .resizable()
+                                .scaledToFill()
+                                .transition(.opacity)
+                        } else if let senderImage = senderLoader.image {
+                            Image(uiImage: senderImage)
+                                .resizable()
+                                .scaledToFill()
+                        } else {
+                            fallback
+                        }
+                    }
+                    .id(inlineURL)
+                } else if let senderImage = senderLoader.image {
+                    Image(uiImage: senderImage)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    fallback
+                }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .clipped()
+        }
+        .task(id: senderAddress) {
+            await senderLoader.load(address: senderAddress)
+        }
+    }
+
+    private var fallback: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color.orange.opacity(0.5), Color.black],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            Image(systemName: "envelope.fill")
+                .font(.system(size: 44))
+                .foregroundStyle(.white.opacity(0.55))
+        }
+    }
+}
+
+private struct WatchSenderArtwork: View {
     let address: String
-    @StateObject private var loader = ArtworkLoader()
+    @StateObject private var loader = WatchArtworkLoader()
 
     var body: some View {
         Group {
@@ -154,33 +357,34 @@ private struct WatchArtwork: View {
                     .scaledToFill()
             } else {
                 ZStack {
-                    Circle().fill(Color.gray.opacity(0.25))
+                    Circle().fill(.white.opacity(0.18))
                     Image(systemName: "envelope.fill")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.8))
                 }
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .clipShape(Circle())
         .task(id: address) { await loader.load(address: address) }
     }
 }
 
 @MainActor
-private final class ArtworkLoader: ObservableObject {
+private final class WatchArtworkLoader: ObservableObject {
     @Published private(set) var image: UIImage?
-    private var loaded: String?
+    private var loadedAddress: String?
 
     func load(address: String) async {
         let key = address.lowercased()
-        guard !key.isEmpty, key != loaded else { return }
-        loaded = key
+        guard !key.isEmpty, key != loadedAddress else { return }
+        loadedAddress = key
         image = nil
         for url in SenderImage.candidateURLs(forAddress: key) {
             guard let (data, response) = try? await URLSession.shared.data(from: url),
-                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-                  let img = UIImage(data: data) else { continue }
-            image = img
+                  let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let candidate = UIImage(data: data) else { continue }
+            image = candidate
             return
         }
     }

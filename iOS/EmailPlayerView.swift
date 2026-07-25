@@ -58,10 +58,9 @@ struct PlayerDetailContent: View {
     /// of sliding away under the menu). Auto-resumes shortly after.
     @State private var holdAutoScroll = false
     @State private var holdScrollTask: Task<Void, Never>?
-    /// The sentence selected by the dedicated reader-mode hold gesture. We use
-    /// our own confirmation dialog instead of UIContextMenuInteraction because
-    /// the surrounding ScrollView and horizontal carousel can make the system
-    /// context-menu recognizer lose the same touch intermittently.
+    /// The sentence selected by the dedicated reader-mode hold gesture. Its
+    /// confirmation dialog is attached directly to that sentence row so the
+    /// popover arrow appears beside the text that was actually pressed.
     @State private var pendingSkip: PendingSkip?
 
     private struct PendingSkip {
@@ -299,40 +298,6 @@ struct PlayerDetailContent: View {
             } message: { _ in
                 Text("Un-mutes it everywhere it was muted.")
             }
-            .confirmationDialog(
-                pendingSkip?.isSkipped == true
-                    ? "Read this sentence again?"
-                    : "Never read this sentence again?",
-                isPresented: Binding(
-                    get: { pendingSkip != nil },
-                    set: { if !$0 { endScrollHold() } }
-                ),
-                titleVisibility: .visible,
-                presenting: pendingSkip
-            ) { selection in
-                if selection.isSkipped {
-                    Button("Read it again") {
-                        unskipMatching(selection.text)
-                        endScrollHold()
-                    }
-                } else {
-                    Button("Skip from this sender") {
-                        skipRules.add(phrase: selection.text,
-                                      sender: selection.senderAddress,
-                                      label: selection.senderLabel)
-                        endScrollHold()
-                    }
-                    Button("Skip from everyone") {
-                        skipRules.add(phrase: selection.text,
-                                      sender: "",
-                                      label: selection.senderLabel)
-                        endScrollHold()
-                    }
-                }
-                Button("Cancel", role: .cancel) { endScrollHold() }
-            } message: { selection in
-                Text(selection.text)
-            }
             .alert("Playback problem", isPresented: .constant(player.errorMessage != nil)) {
                 Button("OK") { player.errorMessage = nil }
             } message: {
@@ -486,9 +451,22 @@ struct PlayerDetailContent: View {
                 // of the transcript still works; once captured, stay captured for
                 // the rest of this gesture even if the ratio changes.
                 guard isDragging || abs(dx) > abs(dy) * 1.2 else { return }
-                isDragging = true
-                swipeDirection = dx < 0 ? 1 : -1
-                dragTranslation = dx
+                if !isDragging {
+                    isDragging = true
+                    swipeDirection = dx < 0 ? 1 : -1
+                } else if abs(dx) > 18 {
+                    // Don't let tiny reversals around the resting point alternate
+                    // the neighbor pane between opposite sides every frame.
+                    swipeDirection = dx < 0 ? 1 : -1
+                }
+                let bounded = min(max(dx, -paneWidth), paneWidth)
+                // A live drag must never inherit an animation from playback,
+                // auto-scroll, or another surrounding SwiftUI transaction.
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    dragTranslation = bounded
+                }
             }
             .onEnded { value in
                 guard isDragging else { return }
@@ -646,10 +624,15 @@ struct PlayerDetailContent: View {
             }
             .onChange(of: player.currentBlockIndex) { _, index in
                 // Held while a long-press decision menu is up, so the text doesn't
-                // scroll out from under the menu.
-                guard !holdAutoScroll else { return }
+                // scroll out from under the menu. Also freeze vertical follow-along
+                // while paging horizontally so sentence changes cannot tug the
+                // ScrollView in a second direction beneath the finger.
+                guard !holdAutoScroll, !isDragging, !isSettling else { return }
                 withAnimation(.easeInOut) { proxy.scrollTo(index, anchor: .center) }
             }
+            // Once a drag has clearly locked horizontally, stop the ScrollView from
+            // simultaneously following the small vertical tremor of the same finger.
+            .scrollDisabled(isDragging || isSettling)
             // Swipe left → next item, right → previous — pure navigation that
             // doesn't mark anything read. Simultaneous so vertical scrolling still
             // works; we only act on clearly-horizontal drags. This is the only
@@ -952,6 +935,32 @@ struct PlayerDetailContent: View {
                                                isSkipped: skipped)
                         }
                 )
+                .confirmationDialog(
+                    "",
+                    isPresented: skipChoicesPresented(for: index),
+                    titleVisibility: .hidden,
+                    presenting: pendingSkip
+                ) { selection in
+                    if selection.isSkipped {
+                        Button("Read it again") {
+                            unskipMatching(selection.text)
+                            endScrollHold()
+                        }
+                    } else {
+                        Button("Skip from this sender") {
+                            skipRules.add(phrase: selection.text,
+                                          sender: selection.senderAddress,
+                                          label: selection.senderLabel)
+                            endScrollHold()
+                        }
+                        Button("Skip from everyone") {
+                            skipRules.add(phrase: selection.text,
+                                          sender: "",
+                                          label: selection.senderLabel)
+                            endScrollHold()
+                        }
+                    }
+                }
         case .image(let image):
             ImageBlockView(image: image, isCurrent: isCurrent) {
                 player.skipImage()
@@ -971,6 +980,19 @@ struct PlayerDetailContent: View {
                                   senderLabel: from.displayName,
                                   isSkipped: isSkipped)
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    }
+
+    /// Only the selected row presents the dialog. Keeping this binding on the row
+    /// gives SwiftUI the correct source rectangle for its popover placement.
+    private func skipChoicesPresented(for blockIndex: Int) -> Binding<Bool> {
+        Binding(
+            get: { pendingSkip?.blockIndex == blockIndex },
+            set: { isPresented in
+                if !isPresented, pendingSkip?.blockIndex == blockIndex {
+                    endScrollHold()
+                }
+            }
+        )
     }
 
     /// The sender address of what's on screen, for matching skip rules.
@@ -1122,16 +1144,9 @@ private struct SentenceText: View {
     var isSkipped: Bool = false
     /// True while the skip choices for this exact sentence are visible.
     var isPendingSkip: Bool = false
-    /// Must match the transcript's `VStack` spacing so a run's fill bridges the
-    /// gap to the next sentence exactly, with no seam and no overlap.
-    private static let blockSpacing: CGFloat = 16
-    private static let cornerRadius: CGFloat = 8
 
     private var isRTL: Bool { LanguageTools.isRightToLeft(text) }
     private var isNoted: Bool { notedPosition != .none }
-    private var roundsTop: Bool { notedPosition == .single || notedPosition == .first }
-    private var roundsBottom: Bool { notedPosition == .single || notedPosition == .last }
-    private var bridgesToNext: Bool { notedPosition == .first || notedPosition == .middle }
 
     /// Extra leading inset per nesting level so nested bullets sit in from their
     /// parent. Level 1 isn't indented; each deeper level adds a step.
@@ -1144,18 +1159,6 @@ private struct SentenceText: View {
             .padding(.horizontal, 8).padding(.vertical, 6)
             .padding(isRTL ? .trailing : .leading, listIndent)
             .frame(maxWidth: .infinity, alignment: isRTL ? .trailing : .leading)
-            .background(highlightBackground)
-            // A lone noted sentence that's being read gets the "now reading" accent
-            // as a ring; within a multi-sentence run the highlighted word suffices.
-            .overlay {
-                if isPendingSkip {
-                    RoundedRectangle(cornerRadius: Self.cornerRadius)
-                        .strokeBorder(Color.orange, lineWidth: 2)
-                } else if isCurrent && notedPosition == .single {
-                    RoundedRectangle(cornerRadius: Self.cornerRadius)
-                        .strokeBorder(Color.accentColor, lineWidth: 2)
-                }
-            }
             // One marker for the whole highlight (on its first sentence), so a
             // passage spanning several sentences doesn't look like several notes.
             .overlay(alignment: isRTL ? .topLeading : .topTrailing) {
@@ -1199,29 +1202,16 @@ private struct SentenceText: View {
         }
     }
 
-    /// A noted run renders as one continuous yellow shape: only the run's ends are
-    /// rounded, and every sentence but the last reaches down into the inter-sentence
-    /// gap to meet the next one. The sentence being read gets no background wash —
-    /// the recolored spoken word marks the reading position instead.
-    @ViewBuilder
-    private var highlightBackground: some View {
-        if isPendingSkip {
-            RoundedRectangle(cornerRadius: Self.cornerRadius)
-                .fill(Color.orange.opacity(0.18))
-        } else if isNoted {
-            UnevenRoundedRectangle(
-                topLeadingRadius: roundsTop ? Self.cornerRadius : 0,
-                bottomLeadingRadius: roundsBottom ? Self.cornerRadius : 0,
-                bottomTrailingRadius: roundsBottom ? Self.cornerRadius : 0,
-                topTrailingRadius: roundsTop ? Self.cornerRadius : 0
-            )
-            .fill(Color.yellow.opacity(0.30))
-            .padding(.bottom, bridgesToNext ? -Self.blockSpacing : 0)
-        }
-    }
-
     private var attributed: AttributedString {
         var string = AttributedString(text)
+        // Put the highlight on the glyph run itself rather than the sentence
+        // container. SwiftUI then paints each wrapped line only as far as its text,
+        // leaving trailing whitespace and gaps between paragraphs untouched.
+        if isPendingSkip {
+            string.backgroundColor = Color.orange.opacity(0.18)
+        } else if isNoted {
+            string.backgroundColor = Color.yellow.opacity(0.30)
+        }
         guard isCurrent, let wordRange,
               let swiftRange = Range(wordRange, in: text),
               let attrRange = Range(swiftRange, in: string) else {
@@ -1242,23 +1232,35 @@ private struct ImageBlockView: View {
     let onSkip: () -> Void
 
     var body: some View {
-        // Show the card whenever there's a URL we can try to load. We intentionally
+        // Show the image whenever there's a URL we can try to load. We intentionally
         // do NOT keep a "failed" flag: the old code latched failure from inside the
         // AsyncImage builder (mutating state during a view update), and on iPad the
         // split-view's extra layout passes cancel the in-flight load — that
         // cancellation counted as a failure and permanently collapsed *every* image.
         if let url = image.remoteURL {
-            card(url: url)
+            imageContent(url: url)
         }
     }
 
-    private func card(url: URL) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("Image", systemImage: "photo")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
+    private func imageContent(url: URL) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ZStack(alignment: .topTrailing) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .success(let img):
+                        img.resizable().scaledToFit()
+                    case .failure:
+                        // Genuine fetch failure (rare — decorative images and tracking
+                        // pixels are filtered out upstream). Keep this minimal and
+                        // retryable rather than turning it into another image card.
+                        failurePlaceholder
+                    case .empty:
+                        ProgressView().frame(maxWidth: .infinity, minHeight: 120)
+                    @unknown default:
+                        failurePlaceholder
+                    }
+                }
+
                 if isCurrent {
                     Button(action: onSkip) {
                         Label("Skip", systemImage: "forward.end.fill")
@@ -1266,35 +1268,24 @@ private struct ImageBlockView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
+                    .padding(8)
+                    .accessibilityLabel("Skip image")
                 }
             }
 
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let img):
-                    img.resizable().scaledToFit()
-                case .failure:
-                    // Genuine fetch failure (rare — decorative images and tracking
-                    // pixels are filtered out upstream). Show a muted placeholder
-                    // instead of latching state, so a re-render can retry.
-                    failurePlaceholder
-                case .empty:
-                    ProgressView().frame(maxWidth: .infinity, minHeight: 120)
-                @unknown default:
-                    failurePlaceholder
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-
-            if let alt = image.altText, !alt.isEmpty {
-                Text(alt).font(.caption).foregroundStyle(.secondary)
+            if let caption {
+                Text(caption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
-        .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 14)
-                .fill(isCurrent ? Color.accentColor.opacity(0.12) : Color.gray.opacity(0.08))
-        )
+    }
+
+    private var caption: String? {
+        guard let alt = image.altText?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !alt.isEmpty else { return nil }
+        let genericLabels = ["image", "photo", "graphic"]
+        return genericLabels.contains(alt.lowercased()) ? nil : alt
     }
 
     private var failurePlaceholder: some View {

@@ -91,6 +91,8 @@ struct RootView: View {
                 sender: email.from.displayName,
                 subject: email.subjectOrFallback,
                 senderAddress: email.from.address,
+                artworkURL: watchArtworkURL,
+                currentSentence: player.currentBlock?.spokenText,
                 isPlaying: player.isPlaying,
                 progress: player.progress,
                 secondsRemaining: Int((player.duration * (1 - player.progress)).rounded()),
@@ -100,6 +102,21 @@ struct RootView: View {
             state = .empty
         }
         WatchConnectivityBridge.shared.send(nowPlaying: state)
+    }
+
+    /// Keep the most recently encountered inline image on the watch until playback
+    /// reaches another one, exactly like the lock-screen artwork.
+    private var watchArtworkURL: URL? {
+        guard !player.blocks.isEmpty else { return nil }
+        let upperBound = min(player.currentBlockIndex, player.blocks.count - 1)
+        guard upperBound >= 0 else { return nil }
+        for index in stride(from: upperBound, through: 0, by: -1) {
+            if case .image(let image) = player.blocks[index],
+               let url = image.remoteURL {
+                return url
+            }
+        }
+        return nil
     }
 
     /// iPad (regular width) gets a two-column split — the email list on the left,
